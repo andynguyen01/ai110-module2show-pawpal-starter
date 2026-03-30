@@ -57,6 +57,19 @@ def build_demo_data() -> tuple[Owner, Scheduler]:
 		)
 	)
 
+	dog.add_task(
+		Task(
+			task_id="t-5",
+			pet_id=dog.pet_id,
+			description="Midday potty break",
+			duration_minutes=15,
+			priority="medium",
+			frequency="daily",
+			due_time=time(12, 30),
+			task_type="walk",
+		)
+	)
+
 	cat.add_task(
 		Task(
 			task_id="t-3",
@@ -65,7 +78,7 @@ def build_demo_data() -> tuple[Owner, Scheduler]:
 			duration_minutes=20,
 			priority="medium",
 			frequency="daily",
-			due_time=time(19, 0),
+			due_time=time(12, 30),
 			task_type="enrichment",
 		)
 	)
@@ -92,8 +105,9 @@ def build_demo_data() -> tuple[Owner, Scheduler]:
 
 def print_schedule(owner: Owner, scheduler: Scheduler) -> None:
 	today = date.today()
+	# Mark one task complete so filtering by completion has visible output in terminal.
+	scheduler.mark_task_complete(owner, "t-2", completed_on=today)
 	plan = scheduler.build_daily_plan(owner, today)
-	plan = sorted(plan, key=lambda task: task.due_time or time(23, 59))
 	pet_name_by_id = {pet.pet_id: pet.name for pet in owner.pets}
 	planned_minutes = sum(task.duration_minutes for task in plan)
 	completed_count = sum(1 for task in plan if task.completed)
@@ -133,6 +147,48 @@ def print_schedule(owner: Owner, scheduler: Scheduler) -> None:
 	explanations = scheduler.explain_plan().splitlines()
 	for line in explanations:
 		print(f"- {line.replace('Included: ', '')}")
+
+	print()
+	print("CONFLICT WARNINGS")
+	print("-" * 60)
+	conflicts = scheduler.detect_time_conflicts(plan)
+	conflict_warnings = scheduler.get_conflict_warnings(plan, pet_name_by_id)
+	print(f"Conflict count: {len(conflicts)}")
+	for conflict in conflicts:
+		due_text = conflict["due_time"].strftime("%H:%M")
+		pets_text = ", ".join(pet_name_by_id.get(pet_id, pet_id) for pet_id in conflict["pet_ids"])
+		tasks_text = ", ".join(conflict["task_ids"])
+		print(f"  -> {due_text} | pets: {pets_text} | task_ids: {tasks_text}")
+	if conflict_warnings:
+		for warning in conflict_warnings:
+			print(warning)
+	else:
+		print("No time conflicts detected.")
+
+	print()
+	print("FILTERED VIEWS")
+	print("-" * 60)
+
+	mochi_tasks = scheduler.filter_tasks(plan, owner.pets, pet_name="Mochi")
+	completed_tasks = scheduler.filter_tasks(plan, owner.pets, completed=True)
+	pending_tasks = scheduler.filter_tasks(plan, owner.pets, completed=False)
+
+	print(f"Tasks for Mochi: {len(mochi_tasks)}")
+	for task in mochi_tasks:
+		due_text = task.due_time.strftime("%H:%M") if task.due_time else "--:--"
+		print(f"  {due_text} - {task.description}")
+
+	print(f"Completed tasks: {len(completed_tasks)}")
+	for task in completed_tasks:
+		due_text = task.due_time.strftime("%H:%M") if task.due_time else "--:--"
+		pet_name = pet_name_by_id.get(task.pet_id, task.pet_id)
+		print(f"  {due_text} - {pet_name}: {task.description}")
+
+	print(f"Pending tasks: {len(pending_tasks)}")
+	for task in pending_tasks:
+		due_text = task.due_time.strftime("%H:%M") if task.due_time else "--:--"
+		pet_name = pet_name_by_id.get(task.pet_id, task.pet_id)
+		print(f"  {due_text} - {pet_name}: {task.description}")
 
 
 if __name__ == "__main__":

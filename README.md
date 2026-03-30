@@ -22,6 +22,15 @@ Your final app should:
 - Display the plan clearly (and ideally explain the reasoning)
 - Include tests for the most important scheduling behaviors
 
+## Smarter Scheduling
+
+Recent scheduler upgrades add practical planning improvements:
+
+- Sort tasks by due time so daily plans are shown in chronological order.
+- Filter tasks by pet name and completion status for quick focused views.
+- Auto-create the next recurring task when a daily or weekly task is completed.
+- Detect overlapping task times and return lightweight warning messages instead of crashing.
+
 ## Getting started
 
 ### Setup

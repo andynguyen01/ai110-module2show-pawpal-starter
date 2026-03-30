@@ -42,11 +42,13 @@ class Task:
 		if self.completed and self.frequency == "once":
 			return False
 		if self.frequency == "daily":
-			return True
+			if self.scheduled_for is None:
+				return True
+			return day >= self.scheduled_for
 		if self.frequency == "weekly":
 			if self.scheduled_for is None:
 				return False
-			return day.weekday() == self.scheduled_for.weekday()
+			return day >= self.scheduled_for and day.weekday() == self.scheduled_for.weekday()
 		# once
 		if self.scheduled_for is None:
 			return True
@@ -217,20 +219,89 @@ class Scheduler:
 			collected.extend(pet.get_pending_tasks_for_day(day))
 		return collected
 
-	def rank_tasks(self, tasks: List[Task], current_time: Optional[time] = None) -> List[Task]:
-		"""Sort tasks by urgency, then duration, then description."""
-		if current_time is None:
-			current_time = datetime.now().time()
+	def sort_by_time(self, tasks: List[Task]) -> List[Task]:
+		"""Return tasks in chronological order by due time.
 
+		Tasks without a due time are placed at the end. Description is used as a
+		stable tie-breaker when two tasks have the same due time.
+
+		Args:
+			tasks: Tasks to sort.
+
+		Returns:
+			A new list of tasks sorted by time, earliest first.
+		"""
 		return sorted(
 			tasks,
 			key=lambda task: (
-				task.calculate_urgency(current_time),
-				-task.duration_minutes,
+				task.due_time is None,
+				task.due_time if task.due_time is not None else time.max,
 				task.description.lower(),
 			),
-			reverse=True,
 		)
+
+	def filter_tasks(
+		self,
+		tasks: List[Task],
+		pets: List[Pet],
+		completed: Optional[bool] = None,
+		pet_name: Optional[str] = None,
+	) -> List[Task]:
+		"""Filter tasks by completion status and/or pet name.
+
+		Filtering is optional and composable:
+		- If ``completed`` is provided, only tasks with that status are kept.
+		- If ``pet_name`` is provided, matching is case-insensitive.
+
+		Args:
+			tasks: Tasks to filter.
+			pets: Pets used to map ``pet_id`` values to pet names.
+			completed: Optional completion filter (True or False).
+			pet_name: Optional pet name filter.
+
+		Returns:
+			A list containing only tasks that satisfy all provided filters.
+		"""
+		pet_name_by_id = {pet.pet_id: pet.name for pet in pets}
+		target_pet_name = pet_name.lower().strip() if pet_name is not None else None
+
+		filtered: List[Task] = []
+		for task in tasks:
+			if completed is not None and task.completed != completed:
+				continue
+			if target_pet_name is not None:
+				name_for_task = pet_name_by_id.get(task.pet_id, "")
+				if name_for_task.lower().strip() != target_pet_name:
+					continue
+			filtered.append(task)
+
+		return filtered
+
+	def rank_tasks(self, tasks: List[Task], current_time: Optional[time] = None) -> List[Task]:
+		"""Rank tasks by urgency score, then by shorter duration, then name.
+
+		Urgency is computed by ``Task.calculate_urgency`` using current time.
+		Higher urgency tasks appear first.
+
+		Args:
+			tasks: Tasks to rank.
+			current_time: Optional time reference for urgency scoring.
+
+		Returns:
+			A ranked task list, highest urgency first.
+		"""
+		if current_time is None:
+			current_time = datetime.now().time()
+
+		def rank_key(task: Task) -> tuple[int, int, str]:
+			# Negative urgency gives descending urgency without reverse=True.
+			return (
+				-task.calculate_urgency(current_time),
+				task.duration_minutes,
+				task.description.lower(),
+			)
+
+		return sorted(tasks, key=rank_key)
 
 	def apply_owner_constraints(self, owner: Owner, tasks: List[Task], day: date) -> List[Task]:
 		"""Filter ranked tasks to fit owner limits and preferences."""
@@ -260,7 +331,8 @@ class Scheduler:
 		"""Build and store the selected daily plan for the owner."""
 		candidate_tasks = self.collect_tasks(owner.pets, day)
 		ranked_tasks = self.rank_tasks(candidate_tasks, current_time=current_time)
-		self.daily_plan = self.apply_owner_constraints(owner, ranked_tasks, day)
+		selected_tasks = self.apply_owner_constraints(owner, ranked_tasks, day)
+		self.daily_plan = self.sort_by_time(selected_tasks)
 
 		self._task_index = {task.task_id: task for task in self.daily_plan}
 		self._last_explanations = [
@@ -272,6 +344,127 @@ class Scheduler:
 			task.scheduled_for = day
 
 		return self.daily_plan
+
+	def mark_task_complete(self, owner: Owner, task_id: str, completed_on: Optional[date] = None) -> bool:
+		"""Mark a task complete and create the next recurring task instance.
+
+		For recurring tasks:
+		- ``daily`` creates a new task scheduled for ``completed_on + 1 day``.
+		- ``weekly`` creates a new task scheduled for ``completed_on + 7 days``.
+
+		Args:
+			owner: Owner containing pets and tasks.
+			task_id: Identifier of the task to mark complete.
+			completed_on: Date used to calculate the next recurring date.
+
+		Returns:
+			True if a task was completed; False if not found or already completed.
+		"""
+		if completed_on is None:
+			completed_on = date.today()
+
+		for pet in owner.pets:
+			for task in pet.tasks:
+				if task.task_id != task_id:
+					continue
+				if task.completed:
+					return False
+
+				task.mark_completed()
+
+				if task.frequency in {"daily", "weekly"}:
+					next_due_date = completed_on + timedelta(days=1 if task.frequency == "daily" else 7)
+					next_task = Task(
+						task_id=f"{task.task_id}-next-{next_due_date.isoformat()}",
+						pet_id=task.pet_id,
+						description=task.description,
+						duration_minutes=task.duration_minutes,
+						priority=task.priority,
+						frequency=task.frequency,
+						due_time=task.due_time,
+						task_type=task.task_type,
+						reason=task.reason,
+						scheduled_for=next_due_date,
+					)
+					pet.add_task(next_task)
+
+				return True
+
+		return False
+
+	def detect_time_conflicts(self, tasks: List[Task]) -> List[Dict[str, Any]]:
+		"""Detect same-time scheduling conflicts in a task list.
+
+		A conflict is any due time shared by two or more tasks. Tasks without due
+		time are ignored.
+
+		Args:
+			tasks: Tasks to evaluate.
+
+		Returns:
+			A list of conflict dictionaries with due time, involved task IDs,
+			involved pet IDs, and a ``same_pet`` flag.
+		"""
+		tasks_by_due_time: Dict[time, List[Task]] = {}
+		for task in tasks:
+			if task.due_time is None:
+				continue
+			tasks_by_due_time.setdefault(task.due_time, []).append(task)
+
+		conflicts: List[Dict[str, Any]] = []
+		for due_time_value in sorted(tasks_by_due_time.keys()):
+			group = tasks_by_due_time[due_time_value]
+			if len(group) < 2:
+				continue
+
+			pet_ids = {task.pet_id for task in group}
+			conflicts.append(
+				{
+					"due_time": due_time_value,
+					"task_ids": [task.task_id for task in group],
+					"pet_ids": sorted(pet_ids),
+					"same_pet": len(pet_ids) == 1,
+				}
+			)
+
+		return conflicts
+
+	def get_conflict_warnings(
+		self,
+		tasks: List[Task],
+		pet_name_by_id: Optional[Dict[str, str]] = None,
+	) -> List[str]:
+		"""Build lightweight warning messages from detected time conflicts.
+
+		This method never raises for conflicts; it returns human-readable warning
+		strings so callers can display non-blocking alerts in CLI or UI.
+
+		Args:
+			tasks: Tasks to inspect for overlaps.
+			pet_name_by_id: Optional mapping to render pet names in warnings.
+
+		Returns:
+			A list of warning strings. Empty list means no conflicts.
+		"""
+		if pet_name_by_id is None:
+			pet_name_by_id = {}
+
+		warnings: List[str] = []
+		for conflict in self.detect_time_conflicts(tasks):
+			due_time_text = conflict["due_time"].strftime("%H:%M")
+			pet_names = [pet_name_by_id.get(pet_id, pet_id) for pet_id in conflict["pet_ids"]]
+			task_ids_text = ", ".join(conflict["task_ids"])
+			if conflict["same_pet"]:
+				warnings.append(
+					f"Warning: overlapping tasks at {due_time_text} for {pet_names[0]} ({task_ids_text})."
+				)
+			else:
+				pets_text = ", ".join(pet_names)
+				warnings.append(
+					f"Warning: overlapping tasks at {due_time_text} across pets ({pets_text}) [{task_ids_text}]."
+				)
+
+		return warnings
 
 	def reschedule_unfinished_tasks(self, owner: Owner, source_day: date, target_day: Optional[date] = None) -> int:
 		"""Move unfinished once/weekly tasks to a target day."""
